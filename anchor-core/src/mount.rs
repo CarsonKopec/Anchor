@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::runtime::Handle;
 
@@ -50,6 +51,7 @@ pub type Mounter =
 
 struct ActiveMount {
     drive_letter: String,
+    backend: Arc<dyn RemoteFs>,
     stop: StopHandle,
 }
 
@@ -148,12 +150,22 @@ impl MountManager {
     /// the mechanism behind "multiple simultaneous mounts").
     pub fn ensure_drive_letter_free(&self, drive_letter: &str, except: &str) -> Result<()> {
         let active = self.active.lock().unwrap();
+        let owns_letter = active
+            .iter()
+            .any(|(name, m)| name == except && m.drive_letter.eq_ignore_ascii_case(drive_letter));
         for (name, m) in active.iter() {
             if name != except && m.drive_letter.eq_ignore_ascii_case(drive_letter) {
                 return Err(AnchorError::Config(format!(
                     "drive letter {drive_letter} is already in use by '{name}'"
                 )));
             }
+        }
+        drop(active);
+
+        if !owns_letter && windows_drive_letter_in_use(drive_letter) {
+            return Err(AnchorError::Config(format!(
+                "drive letter {drive_letter} is already in use by Windows"
+            )));
         }
         Ok(())
     }
@@ -176,9 +188,10 @@ impl MountManager {
             self.ensure_drive_letter_free(&conn.drive_letter, name)?;
             let secret = self.secrets.retrieve(&conn.credential_key)?;
             let backend = (self.backend_builder)(&conn, &secret)?;
-            let stop = (self.mounter)(&conn, backend, self.runtime.clone())?;
+            let stop = (self.mounter)(&conn, backend.clone(), self.runtime.clone())?;
             Ok(ActiveMount {
                 drive_letter: conn.drive_letter.clone(),
+                backend,
                 stop,
             })
         })();
@@ -203,6 +216,47 @@ impl MountManager {
                     },
                 );
                 Err(e)
+            }
+        }
+    }
+
+    /// Probe active mounts and update state to `Mounted` or `Reconnecting`.
+    ///
+    /// This is intentionally light-weight UI state, not a destructive remount. WinFsp still
+    /// owns the drive; the backend is asked to reconnect its transport in place.
+    pub fn check_active_mounts(&self) {
+        const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let probes: Vec<_> = {
+            let active = self.active.lock().unwrap();
+            active
+                .iter()
+                .map(|(name, mount)| {
+                    (
+                        name.clone(),
+                        mount.drive_letter.clone(),
+                        mount.backend.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        for (name, drive_letter, backend) in probes {
+            let healthy = self.runtime.block_on(async {
+                match tokio::time::timeout(HEALTH_TIMEOUT, backend.is_connected()).await {
+                    Ok(true) => true,
+                    Ok(false) => tokio::time::timeout(HEALTH_TIMEOUT, backend.reconnect())
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false),
+                    Err(_) => false,
+                }
+            });
+
+            if healthy {
+                self.set_state(&name, MountState::Mounted { drive_letter });
+            } else {
+                self.set_state(&name, MountState::Reconnecting);
             }
         }
     }
@@ -249,12 +303,38 @@ impl MountManager {
     }
 }
 
+fn drive_letter_index(drive_letter: &str) -> Option<u32> {
+    let mut chars = drive_letter.chars();
+    let letter = chars.next()?;
+    if chars.next()? != ':' || chars.next().is_some() || !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(letter.to_ascii_uppercase() as u32 - 'A' as u32)
+}
+
+fn drive_letter_in_mask(drive_letter: &str, mask: u32) -> bool {
+    drive_letter_index(drive_letter)
+        .map(|index| mask & (1 << index) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(all(windows, not(test)))]
+fn windows_drive_letter_in_use(drive_letter: &str) -> bool {
+    let mask = unsafe { windows::Win32::Storage::FileSystem::GetLogicalDrives() };
+    mask != 0 && drive_letter_in_mask(drive_letter, mask)
+}
+
+#[cfg(any(not(windows), test))]
+fn windows_drive_letter_in_use(_drive_letter: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ConnectionConfig, Protocol};
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// In-memory secret source — no Credential Manager needed.
     struct FakeSecrets;
@@ -265,11 +345,31 @@ mod tests {
     }
 
     /// A no-op backend that satisfies the trait for state-machine tests.
-    struct NullBackend(String);
+    struct NullBackend {
+        label: String,
+        connected: Arc<AtomicBool>,
+    }
+
+    impl NullBackend {
+        fn new(label: impl Into<String>) -> Self {
+            NullBackend {
+                label: label.into(),
+                connected: Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        fn with_health(label: impl Into<String>, connected: Arc<AtomicBool>) -> Self {
+            NullBackend {
+                label: label.into(),
+                connected,
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl RemoteFs for NullBackend {
         fn label(&self) -> &str {
-            &self.0
+            &self.label
         }
         async fn stat(&self, _: &Path) -> Result<crate::remote_fs::RemoteMetadata> {
             Ok(crate::remote_fs::RemoteMetadata::dir())
@@ -296,10 +396,14 @@ mod tests {
             Ok(())
         }
         async fn is_connected(&self) -> bool {
-            true
+            self.connected.load(Ordering::SeqCst)
         }
         async fn reconnect(&self) -> Result<()> {
-            Ok(())
+            if self.connected.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(AnchorError::Connection("still offline".into()))
+            }
         }
     }
 
@@ -321,6 +425,7 @@ mod tests {
 
     fn manager(conns: Vec<ConnectionConfig>) -> (MountManager, Arc<AtomicUsize>) {
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap();
         let handle = rt.handle().clone();
@@ -331,7 +436,7 @@ mod tests {
         let stops_for_mounter = stops.clone();
 
         let builder: BackendBuilder =
-            Arc::new(|c, _s| Ok(Arc::new(NullBackend(c.name.clone())) as Arc<dyn RemoteFs>));
+            Arc::new(|c, _s| Ok(Arc::new(NullBackend::new(c.name.clone())) as Arc<dyn RemoteFs>));
         let mounter: Mounter = Arc::new(move |_c, _b, _h| {
             let stops = stops_for_mounter.clone();
             let stop: StopHandle = Box::new(move || {
@@ -410,5 +515,62 @@ mod tests {
         let (mgr, _) = manager(vec![conn("a", "M:")]);
         mgr.mount("a").unwrap();
         assert!(mgr.mount("a").is_err());
+    }
+
+    #[test]
+    fn drive_letter_mask_detection_handles_valid_letters() {
+        assert_eq!(drive_letter_index("A:"), Some(0));
+        assert_eq!(drive_letter_index("M:"), Some(12));
+        assert_eq!(drive_letter_index("z:"), Some(25));
+        assert_eq!(drive_letter_index("M"), None);
+        assert_eq!(drive_letter_index("MM:"), None);
+
+        let mask = (1 << 0) | (1 << 12);
+        assert!(drive_letter_in_mask("A:", mask));
+        assert!(drive_letter_in_mask("M:", mask));
+        assert!(!drive_letter_in_mask("Z:", mask));
+    }
+
+    #[test]
+    fn health_check_marks_reconnecting_then_restores_mounted() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        std::mem::forget(rt);
+
+        let connected = Arc::new(AtomicBool::new(false));
+        let connected_for_builder = connected.clone();
+        let builder: BackendBuilder = Arc::new(move |c, _s| {
+            Ok(Arc::new(NullBackend::with_health(
+                c.name.clone(),
+                connected_for_builder.clone(),
+            )) as Arc<dyn RemoteFs>)
+        });
+        let mounter: Mounter = Arc::new(move |_c, _b, _h| {
+            let stop: StopHandle = Box::new(|| Ok(()));
+            Ok(stop)
+        });
+        let mgr = MountManager::new(
+            handle,
+            Arc::new(FakeSecrets),
+            AnchorConfig::from_connections(vec![conn("a", "M:")]),
+            builder,
+            mounter,
+        );
+
+        mgr.mount("a").unwrap();
+        mgr.check_active_mounts();
+        assert_eq!(mgr.status("a"), Some(MountState::Reconnecting));
+
+        connected.store(true, Ordering::SeqCst);
+        mgr.check_active_mounts();
+        assert_eq!(
+            mgr.status("a"),
+            Some(MountState::Mounted {
+                drive_letter: "M:".into()
+            })
+        );
     }
 }
