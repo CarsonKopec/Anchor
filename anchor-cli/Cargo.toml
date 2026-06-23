@@ -1,0 +1,30 @@
+[package]
+name = "anchor-cli"
+description = "Headless CLI for Anchor: configure, test, and mount FTP/SFTP drives. Shares all logic below the UI with anchor-tray."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "anchor"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward the WinFsp host to anchor-fs so `anchor mount` can attach a drive. `dep:winfsp`
+# enables the build-dependency below, whose build.rs applies the /DELAYLOAD link arg to this
+# binary.
+winfsp = ["anchor-fs/winfsp", "dep:winfsp"]
+
+[dependencies]
+anchor-core.workspace = true
+anchor-fs.workspace = true
+clap.workspace = true
+rpassword.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[build-dependencies]
+winfsp = { workspace = true, optional = true }

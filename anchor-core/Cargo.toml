@@ -1,0 +1,25 @@
+[package]
+name = "anchor-core"
+description = "Core abstractions for Anchor: RemoteFs trait, MountManager, config, credentials, caches. No protocol or WinFsp knowledge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tomlplus-syntax.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

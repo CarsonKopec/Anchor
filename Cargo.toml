@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "anchor-core",
+    "anchor-fs",
+    "anchor-cli",
+    "anchor-tray",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Carson Kopec"]
+repository = "https://github.com/CarsonKopec/anchor"
+rust-version = "1.80"
+
+# Shared dependency versions. Pinned to currently-published releases; the spec's
+# original pins (tray-icon 0.14 / tao 0.30) were stale — see README "Version coupling".
+[workspace.dependencies]
+anchor-core = { path = "anchor-core" }
+anchor-fs = { path = "anchor-fs" }
+
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util"] }
+tracing = "0.1"
+
+# Config (TOML+) — the user's own crate; replaces the spec's non-existent "tomlplus" Rust crate.
+tomlplus-syntax = "2.0.0-rc.2"
+
+# Protocol backends
+suppaftp = { version = "6", default-features = false }
+# Use the `ring` crypto backend, not the default `aws-lc-rs` — aws-lc-sys needs NASM + a
+# configured MSVC build env to compile its asm, which isn't a reasonable build prerequisite.
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2"
+bytes = "1"
+
+# WinFsp kernel-filesystem bindings (optional, behind anchor-fs "winfsp" feature)
+winfsp = "0.13"
+winfsp-sys = "0.12"
+
+# Windows APIs (Credential Manager, shell)
+windows = "0.62"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+
+# Tray app — these two version-couple; bump together (see README).
+tray-icon = "0.24"
+tao = "0.35"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

@@ -1,0 +1,77 @@
+# Anchor — example connections.tomlp  (spec §6.2)
+#
+# Copy to %APPDATA%\Anchor\connections.tomlp and edit, or use `anchor add`.
+#
+# Secrets are NOT stored here. `credential_key` is a *reference* into Windows Credential
+# Manager (target name `Anchor:<credential_key>`); set the actual password with
+#   anchor set-password <name>
+#
+# The @-annotations below are enforced at load time by tomlplus-syntax: a bad port range,
+# a missing required key, or an invalid drive letter fails fast, naming the offending key.
+
+# ── SFTP (preferred whenever the server supports it — see spec §5.2) ────────────────────
+[connections.media-box]
+@required
+@enum: ["ftp", "ftps", "sftp"]
+protocol = "sftp"
+
+@required
+host = "media.example.com"
+
+@type: int
+@min: 1
+@max: 65535
+port = 22
+
+@required
+username = "carson"
+
+# Reference into Credential Manager, never the password itself.
+@required
+credential_key = "media-box"
+
+@pattern: "[A-Z]:"
+drive_letter = "M:"
+
+remote_path = "/srv/media"
+read_only = false
+
+@type: int
+@min: 1
+@max: 3600
+dir_cache_ttl_secs = 10
+
+auto_mount_on_start = true
+
+# ── FTPS (explicit TLS) — legacy server, mounted read-only ──────────────────────────────
+[connections.archive]
+@required
+@enum: ["ftp", "ftps", "sftp"]
+protocol = "ftps"
+
+@required
+host = "archive.example.com"
+
+@type: int
+@min: 1
+@max: 65535
+port = 21
+
+@required
+username = "backup"
+
+@required
+credential_key = "archive"
+
+@pattern: "[A-Z]:"
+drive_letter = "A:"
+
+remote_path = "/"
+read_only = true
+
+@type: int
+@min: 1
+@max: 3600
+dir_cache_ttl_secs = 30
+
+auto_mount_on_start = false

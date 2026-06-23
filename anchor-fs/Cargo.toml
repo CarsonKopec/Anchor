@@ -1,0 +1,55 @@
+[package]
+name = "anchor-fs"
+description = "Anchor filesystem glue: FTP/SFTP backends implementing RemoteFs, plus the (feature-gated) WinFsp host. The only crate that touches a wire protocol or WinFsp."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# The actual WinFsp kernel-filesystem host. Off by default so the workspace builds and the
+# backends are testable without WinFsp installed; turn on for a real mount on a WinFsp box:
+#   cargo build --release --features winfsp
+winfsp = ["dep:winfsp", "dep:winfsp-sys", "dep:windows"]
+
+[dependencies]
+anchor-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+# FTP/FTPS — synchronous API (see module docs for why not async).
+suppaftp = { workspace = true, features = ["native-tls"] }
+
+# SFTP
+russh.workspace = true
+russh-sftp.workspace = true
+
+# WinFsp host (optional) — see winfsp_host.rs. winfsp-sys supplies the trait's parameter
+# types (FILE_ACCESS_RIGHTS etc.); windows supplies the NTSTATUS constants (spec §4.3).
+winfsp = { workspace = true, optional = true }
+winfsp-sys = { workspace = true, optional = true }
+# Win32_System_Registry + Win32_System_LibraryLoader: read WinFsp's InstallDir and add its
+# bin dir to the DLL search path so winfsp_init can load winfsp-x64.dll (the winfsp crate's
+# own registry lookup is behind its `system` feature, which would require the WinFsp SDK
+# headers to build — so we do this small lookup ourselves instead).
+windows = { workspace = true, optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+] }
+
+# Delay-load linking for WinFsp is only needed when the `winfsp` feature is on; this build
+# dependency is enabled by that feature too (see build.rs), so the default build pulls none
+# of the WinFsp toolchain.
+[build-dependencies]
+winfsp = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

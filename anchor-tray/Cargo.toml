@@ -1,0 +1,29 @@
+[package]
+name = "anchor-tray"
+description = "Background tray app for Anchor: per-connection mount/unmount from the system tray. Shares all logic below the UI with anchor-cli."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "anchor-tray"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward the WinFsp host so the tray can attach drives. `dep:winfsp` enables the
+# build-dependency whose build.rs applies the /DELAYLOAD link arg to this binary.
+winfsp = ["anchor-fs/winfsp", "dep:winfsp"]
+
+[dependencies]
+anchor-core.workspace = true
+anchor-fs.workspace = true
+tokio = { workspace = true }
+tray-icon.workspace = true
+tao.workspace = true
+
+[build-dependencies]
+winfsp = { workspace = true, optional = true }
