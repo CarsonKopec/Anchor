@@ -15,7 +15,7 @@ pub mod host_keys;
 pub mod mount;
 pub mod remote_fs;
 
-pub use cache::{DirCache, ReadAheadBuffer, READAHEAD_CHUNK};
+pub use cache::{DirCache, ReadAheadBuffer, StatCache, READAHEAD_CHUNK};
 pub use config::{AnchorConfig, ConnectionConfig, Protocol};
 pub use credentials::{CredentialStore, Secret, Secrets};
 pub use error::{AnchorError, Result};

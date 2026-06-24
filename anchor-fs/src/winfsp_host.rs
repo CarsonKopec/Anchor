@@ -29,7 +29,7 @@ use windows::Win32::Foundation::{
     STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNSUCCESSFUL,
 };
 
-use anchor_core::cache::{DirCache, ReadAheadBuffer, READAHEAD_CHUNK};
+use anchor_core::cache::{DirCache, ReadAheadBuffer, StatCache};
 use anchor_core::config::ConnectionConfig;
 use anchor_core::error::{AnchorError, Result as AnchorResult};
 use anchor_core::mount::StopHandle;
@@ -57,6 +57,7 @@ pub struct AnchorFsContext {
     backend: Arc<dyn RemoteFs>,
     runtime: tokio::runtime::Handle,
     dir_cache: DirCache,
+    stat_cache: StatCache,
     read_buf: ReadAheadBuffer,
     read_only: bool,
     label: String,
@@ -71,7 +72,12 @@ impl AnchorFsContext {
     }
 
     fn stat(&self, path: &Path) -> std::result::Result<RemoteMetadata, FspError> {
-        self.run(self.backend.stat(path)).map_err(|e| nt(&e))
+        if let Some(meta) = self.stat_cache.get(path) {
+            return Ok(meta);
+        }
+        let meta = self.run(self.backend.stat(path)).map_err(|e| nt(&e))?;
+        self.stat_cache.insert(path, meta.clone());
+        Ok(meta)
     }
 
     /// List a directory, consulting (and populating) the TTL'd [`DirCache`].
@@ -83,8 +89,16 @@ impl AnchorFsContext {
             return Ok(cached);
         }
         let entries = self.run(self.backend.list_dir(path)).map_err(|e| nt(&e))?;
+        self.stat_cache.insert_dir_entries(path, &entries);
         self.dir_cache.insert(path, entries.clone());
         Ok(entries)
+    }
+
+    fn invalidate_changed_path(&self, path: &Path) {
+        self.dir_cache.invalidate_parent(path);
+        self.stat_cache.invalidate(path);
+        self.stat_cache.invalidate_parent_children(path);
+        self.read_buf.invalidate(path);
     }
 
     fn deny_if_read_only(&self) -> std::result::Result<(), FspError> {
@@ -152,7 +166,7 @@ impl FileSystemContext for AnchorFsContext {
         let is_dir = create_options & FILE_DIRECTORY_FILE != 0;
         self.run(self.backend.create(&path, is_dir))
             .map_err(|e| nt(&e))?;
-        self.dir_cache.invalidate_parent(&path);
+        self.invalidate_changed_path(&path);
         let meta = self.stat(&path).unwrap_or(RemoteMetadata {
             is_dir,
             len: 0,
@@ -170,8 +184,7 @@ impl FileSystemContext for AnchorFsContext {
         // Deletion completes here, when the delete flag is set (spec §4.2 step 4).
         if flags & FSP_CLEANUP_DELETE != 0 && !self.read_only {
             let _ = self.run(self.backend.remove(&context.path, context.is_dir));
-            self.dir_cache.invalidate_parent(&context.path);
-            self.read_buf.invalidate(&context.path);
+            self.invalidate_changed_path(&context.path);
         }
     }
 
@@ -217,9 +230,8 @@ impl FileSystemContext for AnchorFsContext {
         let to = to_path(new_file_name);
         self.run(self.backend.rename(&from, &to))
             .map_err(|e| nt(&e))?;
-        self.dir_cache.invalidate_parent(&from);
-        self.dir_cache.invalidate_parent(&to);
-        self.read_buf.invalidate(&from);
+        self.invalidate_changed_path(&from);
+        self.invalidate_changed_path(&to);
         Ok(())
     }
 
@@ -235,7 +247,7 @@ impl FileSystemContext for AnchorFsContext {
         if !set_allocation_size {
             self.run(self.backend.set_len(&context.path, new_size))
                 .map_err(|e| nt(&e))?;
-            self.read_buf.invalidate(&context.path);
+            self.invalidate_changed_path(&context.path);
         }
         let meta = self.stat(&context.path).unwrap_or(RemoteMetadata {
             is_dir: false,
@@ -258,12 +270,14 @@ impl FileSystemContext for AnchorFsContext {
             buffer[..data.len()].copy_from_slice(&data);
             return Ok(data.len() as u32);
         }
-        // Miss: fetch a 256 KiB window at this offset, cache it, return the requested slice.
-        let fetch = want.max(READAHEAD_CHUNK as u32);
+        // Miss: fetch an adaptive read-ahead window at this offset, cache it, and return
+        // the requested slice.
+        let fetch = self.read_buf.next_fetch_len(&context.path, offset, want);
         let chunk = self
-            .run(self.backend.read(&context.path, offset, fetch))
+            .run(self.backend.read(&context.path, offset, fetch as u32))
             .map_err(|e| nt(&e))?;
-        self.read_buf.fill(&context.path, offset, chunk.clone());
+        self.read_buf
+            .fill_with_request(&context.path, offset, chunk.clone(), fetch);
         let n = (want as usize).min(chunk.len());
         buffer[..n].copy_from_slice(&chunk[..n]);
         Ok(n as u32)
@@ -288,8 +302,7 @@ impl FileSystemContext for AnchorFsContext {
         let n = self
             .run(self.backend.write(&context.path, at, buffer))
             .map_err(|e| nt(&e))?;
-        self.read_buf.invalidate(&context.path);
-        self.dir_cache.invalidate_parent(&context.path);
+        self.invalidate_changed_path(&context.path);
         let meta = self.stat(&context.path).unwrap_or(RemoteMetadata {
             is_dir: false,
             len: at + n as u64,
@@ -439,6 +452,7 @@ pub fn mount(
         backend,
         runtime,
         dir_cache: DirCache::new(Duration::from_secs(conn.dir_cache_ttl_secs)),
+        stat_cache: StatCache::new(Duration::from_secs(conn.dir_cache_ttl_secs)),
         read_buf: ReadAheadBuffer::new(),
         read_only: conn.read_only,
         label: conn.name.clone(),
